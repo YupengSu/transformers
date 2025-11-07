@@ -31,6 +31,12 @@ _import_structure = {
         "replace_with_bitnet_linear",
         "unpack_weights",
     ],
+    "bipolarnet": [
+        "BipolarLinear",
+        "pack_weights",
+        "replace_with_bipolarnet_linear",
+        "unpack_weights",
+    ],
     "bitsandbytes": [
         "dequantize_and_replace",
         "get_keys_to_not_convert",
@@ -174,6 +180,12 @@ if TYPE_CHECKING:
         BitLinear,
         pack_weights,
         replace_with_bitnet_linear,
+        unpack_weights,
+    )
+    from .bipolarnet import (
+        BipolarLinear,
+        pack_weights,
+        replace_with_bipolarnet_linear,
         unpack_weights,
     )
     from .bitsandbytes import (

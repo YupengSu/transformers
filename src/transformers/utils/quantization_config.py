@@ -60,6 +60,7 @@ class QuantizationMethod(str, Enum):
     FBGEMM_FP8 = "fbgemm_fp8"
     TORCHAO = "torchao"
     BITNET = "bitnet"
+    BIPOLARNET = "bipolarnet"
     SPQR = "spqr"
     FP8 = "fp8"
     QUARK = "quark"
@@ -1903,6 +1904,60 @@ class BitNetQuantConfig(QuantizationConfigMixin):
         Safety checker that arguments are correct
         """
 
+@dataclass
+class BipolarNetQuantConfig(QuantizationConfigMixin):
+    """
+    Configuration class for applying BipolarNet quantization.
+
+    Args:
+        modules_to_not_convert (`Optional[List]`, *optional*):
+            Optionally, provides a list of full paths of `nn.Linear` weight parameters
+            that shall not be quantized. Defaults to None.
+        linear_class (`str`, *optional*, defaults to `"bipolarlinear"`):
+            The type of linear class to use. Can be either `bipolarlinear` or `autobipolarlinear`.
+        quantization_mode (`str`, *optional*, defaults to `"offline"`):
+            The quantization mode to use. Can be either `online` or `offline`.
+            In `online` mode, the weight quantization parameters are calculated dynamically
+            during each forward pass (e.g., based on the current weight values). This can
+            adapt to weight changes during training (Quantization-Aware Training - QAT).
+            In `offline` mode, quantization parameters are pre-calculated *before* inference.
+            These parameters are then fixed and loaded into the quantized model. This
+            generally results in lower runtime overhead compared to online quantization.
+        use_rms_norm (`bool`, *optional*, defaults to `False`):
+            Whether to apply RMSNorm on the activations before quantization. This matches the original BitNet paper's approach
+            of normalizing activations before quantization/packing.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+            The epsilon value used in the RMSNorm layer for numerical stability.
+        kwargs (`dict[str, Any]`, *optional*):
+            Additional keyword arguments that may be used by specific quantization
+            backends or future versions.
+    """
+
+    def __init__(
+        self,
+        modules_to_not_convert: list | None = None,
+        linear_class: str = "bipolarlinear",
+        quantization_mode: str = "offline",
+        use_rms_norm: bool = False,
+        rms_norm_eps: float | None = 1e-6,
+        **kwargs,
+    ):
+        if linear_class not in ["bipolarlinear", "autobipolarlinear"]:
+            raise ValueError(f"linear_class must be either 'bipolarlinear' or 'autobipolarlinear', but got {linear_class}")
+        if quantization_mode not in ["online", "offline"]:
+            raise ValueError(f"quantization_mode must be either 'online' or 'offline', but got {quantization_mode}")
+        self.quant_method = QuantizationMethod.BIPOLARNET
+        self.modules_to_not_convert = modules_to_not_convert
+        self.linear_class = linear_class
+        self.quantization_mode = quantization_mode
+        self.use_rms_norm = use_rms_norm
+        self.rms_norm_eps = rms_norm_eps
+        self.post_init()
+
+    def post_init(self):
+        r"""
+        Safety checker that arguments are correct
+        """
 
 @dataclass
 class SpQRConfig(QuantizationConfigMixin):
