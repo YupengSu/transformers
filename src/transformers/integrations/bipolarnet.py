@@ -1,3 +1,7 @@
+# This implementation is adapted from the BitNet integration in Hugging Face Transformers
+# (https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/bitnet.py).
+# The code has been modified to support a 0/1 binary quantization scheme with separate positive and negative weight branches, custom scaling logic, and updated loading/unpacking behavior.
+
 from ..utils import is_accelerate_available, is_torch_available, logging
 
 
@@ -12,26 +16,28 @@ if is_torch_available():
 logger = logging.get_logger(__name__)
 
 
-# TODO: [offline inference] if uint8 packing is used, we can pack 8 values into a single byte
 VALUES_PER_ITEM = 8
 
-# TODO: [offline inference] pack_weights
+
 def pack_weights(quantized_weights: torch.Tensor) -> torch.Tensor:
     """
-    Packs a tensor of quantized weights into a compact format using 2 bits per value.
+    Packs a tensor of binary weights (0/1) into a compact 1-bit-per-value format.
+    Each uint8 stores 8 binary weight values.
 
-    Parameters:
-    -----------
-    quantized_weights : torch.Tensor
-        A tensor containing ternary quantized weights with values in {-1, 0, 1}. These values are adjusted to
-        {0, 1, 2} before being packed.
+    Parameters
+    ----------
+    weights : torch.Tensor
+        A tensor containing binary weights with values in {0, 1}.
+        shape: [out_features, in_features] or [in_features]
 
-    Returns:
-    --------
+    Returns
+    -------
     torch.Tensor
-        A packed tensor where each element stores 4 quantized values (each using 2 bits) in an 8-bit format.
+        A packed tensor where each element stores 8 binary values.
+        shape: [out_features, ceil(in_features / 8)] or [ceil(in_features / 8)]
     """
 
+    quantized_weights = quantized_weights.transpose(0, -1).contiguous()
     original_shape = quantized_weights.shape
 
     row_dim = (original_shape[0] + VALUES_PER_ITEM - 1) // VALUES_PER_ITEM
@@ -41,19 +47,19 @@ def pack_weights(quantized_weights: torch.Tensor) -> torch.Tensor:
     else:
         packed_tensor_shape = (row_dim, *original_shape[1:])
 
-    quantized_weights += 1
     packed = torch.zeros(packed_tensor_shape, device=quantized_weights.device, dtype=torch.uint8)
     unpacked = quantized_weights.to(torch.uint8)
 
-    it = min(VALUES_PER_ITEM, (original_shape[0] // row_dim) + 1)
-    for i in range(it):
-        start = i * row_dim
-        end = min(start + row_dim, original_shape[0])
-        packed[: (end - start)] |= unpacked[start:end] << 2 * i
-
+    for i in range(row_dim):
+        for bit in range(VALUES_PER_ITEM):
+            idx = i * VALUES_PER_ITEM + bit
+            if idx < original_shape[0]:
+                packed[i] |= (unpacked[idx] & 1) << bit
+                
+    packed = packed.transpose(0, -1).contiguous()
     return packed
 
-# TODO: [offline inference] unpack_weights
+
 @torch.compile
 def unpack_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """
@@ -62,47 +68,16 @@ def unpack_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     Parameters:
     -----------
     packed : torch.Tensor
-        A tensor containing packed weights where each element represents 4 quantized values (using 2 bits per value).
+        A tensor containing packed weights where each element represents 8 quantized values (using 1 bits per value).
     dtype : torch.dtype
         The dtype of the returned Tensor
     Returns:
     --------
     torch.Tensor
-        A tensor of unpacked weights, where each value is converted from its packed 2-bit representation.
-
-    Example:
-    --------
-    packed = torch.tensor([[0b10100001, 0b00011000],
-                           [0b10010000, 0b00001010]], dtype=torch.uint8)
-
-    # Unpack the values
-    unpacked = unpack_weights(packed)
-
-    # Resulting unpacked tensor
-    print(unpacked)
-    # Output: tensor([[ 0, -1],
-                      [-1,  1],
-                      [-1,  1],
-                      [-1,  1],
-                      [ 1,  0],
-                      [ 0, -1],
-                      [ 1, -1],
-                      [ 1, -1]])
-
-    Explanation of the example:
-    ---------------------------
-    Let's take the first value for example 0b10100001, we we will only focus on the first column,
-    because every element is unpacked across the first dimension
-    - First 2 bits: `01` → 0 at [0][0]
-    - Second 2 bits: `00` → -1 at [0][2]
-    - Third 2 bits: `10` → 1 at [0][4]
-    - Fourth 2 bits: `10` → 1 at [0][6]
-    the second value of the same row (0b10010000) will give the values for [0][1], [0][3], [0][5], [0][7]
-
-    We subtract 1 because during the packing process, it's easier to work with values like 0, 1, and 2. To make this possible,
-    we add 1 to the original ternary weights (which are typically -1, 0, and 1) when packing them. When unpacking, we reverse
-    this by subtracting 1 to restore the original ternary values.
+        A tensor of unpacked weights, where each value is converted from its packed 1-bit representation.
     """
+    
+    packed = packed.transpose(0, -1).contiguous()
     packed_shape = packed.shape
 
     if len(packed_shape) == 1:
@@ -114,15 +89,15 @@ def unpack_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
     unpacked = torch.zeros(unpacked_shape, device=packed.device, dtype=torch.uint8)
 
-    for i in range(VALUES_PER_ITEM):
-        start = i * packed_shape[0]
-        end = start + packed_shape[0]
-        mask = 3 << (2 * i)
-        unpacked[start:end] = (packed & mask) >> (2 * i)
+    for i in range(packed_shape[0]):
+        for bit in range(VALUES_PER_ITEM):
+            idx = i * VALUES_PER_ITEM + bit
+            unpacked[idx] = (packed[i] >> bit) & 1
+    
+    unpacked = unpacked.transpose(0, -1).contiguous()
+    return unpacked.to(dtype)
 
-    return unpacked.to(dtype) - 1
 
-# TODO: [offline inference] BipolarLinear
 class BipolarLinear(nn.Module):
     def __init__(
         self,
@@ -138,22 +113,25 @@ class BipolarLinear(nn.Module):
         self.dtype = dtype
         self.in_features = in_features
         self.out_features = out_features
+        
         self.register_buffer(
-            "weight",
-            torch.zeros(
-                (out_features // VALUES_PER_ITEM, in_features),
-                dtype=torch.uint8,
-                device=device,
-            ),
+            "weight_pos",
+            torch.zeros((out_features, in_features // VALUES_PER_ITEM), dtype=torch.uint8, device=device),
         )
         self.register_buffer(
-            "weight_scale",
-            torch.ones(
-                (1),
-                dtype=dtype,
-                device=device,
-            ),
+            "weight_neg",
+            torch.zeros((out_features, in_features // VALUES_PER_ITEM), dtype=torch.uint8, device=device),
         )
+        
+        self.register_buffer(
+            "weight_scale_pos",
+            torch.ones((out_features,), dtype=dtype, device=device)
+        )
+        self.register_buffer(
+            "weight_scale_neg",
+            torch.ones((out_features,), dtype=dtype, device=device)
+        )
+            
         if bias:
             self.register_buffer("bias", torch.zeros((out_features), dtype=dtype, device=device))
         else:
@@ -163,7 +141,6 @@ class BipolarLinear(nn.Module):
         self.rms_norm = None
         if use_rms_norm:
             from ..models.llama.modeling_llama import LlamaRMSNorm
-
             self.rms_norm = LlamaRMSNorm(in_features, eps=rms_norm_eps)
 
     @torch.compile
@@ -172,16 +149,16 @@ class BipolarLinear(nn.Module):
         Activation function : Performs symmetric, per-token quantization on the input activations.
         Parameters:
         -----------
-        x : torch.Tensor
+        x : torch.Tensor [batch, seq, hidden]
             Input activations to be quantized.
         num_bits : int, optional (default=8)
             Number of bits to use for quantization, determining the quantization range.
 
         Returns:
         --------
-        result : torch.Tensor
+        result : torch.Tensor [batch, seq, hidden]
             Quantized activation tensor, with values mapped to an `int8` range.
-        scale : torch.Tensor
+        scale : torch.Tensor [batch, seq, 1]
             The per-channel scaling factors used to quantize the tensor.
         """
         Qn = -(2 ** (num_bits - 1))
@@ -190,21 +167,20 @@ class BipolarLinear(nn.Module):
         result = (input * scale).round().clamp(Qn, Qp)
         return result.to(torch.int8), scale
 
-    @torch.compile
-    def post_quant_process(self, input, input_scale, weight_scale):
-        out = input / (input_scale * weight_scale)
-        return out
-
     def forward(self, input):
         # Apply RMSNorm on the input if requested.
         if self.rms_norm is not None:
             input = self.rms_norm(input)
-
-        w = self.weight
-        w_quant = unpack_weights(w, dtype=self.dtype)
+        w_pos = unpack_weights(self.weight_pos, dtype=self.dtype)
+        w_neg = unpack_weights(self.weight_neg, dtype=self.dtype)
         input_quant, input_scale = self.activation_quant(input)
-        y = F.linear(input_quant.to(self.dtype), w_quant)
-        y = self.post_quant_process(y, self.weight_scale, input_scale)
+        
+        y_pos = F.linear(input_quant.to(self.dtype), w_pos)
+        y_neg = F.linear(input_quant.to(self.dtype), w_neg)
+        
+        y = (y_pos / self.weight_scale_pos) - (y_neg / self.weight_scale_neg)
+        y = y / input_scale
+        
         if self.bias is not None:
             y += self.bias.view(1, -1).expand_as(y)
         return y
@@ -213,18 +189,18 @@ class BipolarLinear(nn.Module):
 class WeightQuant(torch.autograd.Function):
     """
     Implements a custom autograd function for weight quantization.
-    This performs ternary quantization (-1, 0, 1) based on scaling by the
-    mean absolute value of the weights. It uses the Straight-Through Estimator
+    This performs binary quantization (0, 1) based on scaling by the
+    mean value of the positive weights. It uses the Straight-Through Estimator
     (STE) for the backward pass.
     """
 
     @staticmethod
-    @torch.compile
     def forward(ctx, weight):
         dtype = weight.dtype
         weight = weight.float()
-        scale = 1.0 / weight.abs().mean().clamp_(min=1e-5)
-        weight = (weight * scale).round().clamp(-1, 1) / scale
+        weight_bin = (weight >= 0).float()
+        scale = weight_bin.sum() / (weight.abs() * weight_bin).sum().clamp(min=1e-5)
+        weight = weight_bin / scale
         return weight.to(dtype)
 
     @staticmethod
@@ -256,7 +232,7 @@ class ActQuant(torch.autograd.Function):
         return grad_input
 
 
-class AutoBipolarLinear(nn.Linear):
+class AutoBipolarLinear(nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -268,23 +244,30 @@ class AutoBipolarLinear(nn.Linear):
         use_rms_norm: bool = False,
         rms_norm_eps: float = 1e-6,
     ):
-        super().__init__(in_features, out_features, bias)
+        super().__init__()
+        
+        self.in_features = in_features
+        self.out_features = out_features
         self.online_quant = online_quant
+        self.dtype = dtype
+        
         # Optional RMSNorm
         self.rms_norm = None
         if use_rms_norm:
             from ..models.llama.modeling_llama import LlamaRMSNorm
-
             self.rms_norm = LlamaRMSNorm(in_features, eps=rms_norm_eps)
+        
+        self.weight_pos = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        self.weight_neg = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
+        else:
+            self.bias = None
+
         if not online_quant:
-            self.register_buffer(
-                "weight_scale",
-                torch.ones(
-                    (1),
-                    dtype=dtype,
-                    device=device,
-                ),
-            )
+            self.register_buffer("weight_scale_pos", torch.ones(out_features, dtype=dtype, device=device))
+            self.register_buffer("weight_scale_neg", torch.ones(out_features, dtype=dtype, device=device))
+
             self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(
@@ -294,8 +277,10 @@ class AutoBipolarLinear(nn.Linear):
         *args,
         **kwargs,
     ):
-        if (prefix + "weight") in state_dict and state_dict[prefix + "weight"].dtype != self.weight.dtype:
-            state_dict[prefix + "weight"] = unpack_weights(state_dict[prefix + "weight"], dtype=self.weight.dtype)
+        if (prefix + "weight_pos") in state_dict and state_dict[prefix + "weight_pos"].dtype != self.weight_pos.dtype:
+            state_dict[prefix + "weight_pos"] = unpack_weights(state_dict[prefix + "weight_pos"], dtype=self.weight_pos.dtype)
+        if (prefix + "weight_neg") in state_dict and state_dict[prefix + "weight_neg"].dtype != self.weight_neg.dtype:
+            state_dict[prefix + "weight_neg"] = unpack_weights(state_dict[prefix + "weight_neg"], dtype=self.weight_neg.dtype)
         return state_dict
 
     def forward(self, input):
@@ -304,16 +289,18 @@ class AutoBipolarLinear(nn.Linear):
             input = self.rms_norm(input)
 
         if self.online_quant:
-            weight = WeightQuant.apply(self.weight)
+            weight_pos = WeightQuant.apply(self.weight_pos)
+            weight_neg = WeightQuant.apply(self.weight_neg)
         else:
-            weight = self.weight
+            weight_pos = self.weight_pos
+            weight_neg = self.weight_neg
         input = ActQuant.apply(input)
-        output = F.linear(input, weight, self.bias)
         if not self.online_quant:
-            output = output * self.weight_scale
+            weight_pos = weight_pos / self.weight_scale_pos
+            weight_neg = weight_neg / self.weight_scale_neg
+        output = F.linear(input, weight_pos - weight_neg, self.bias)
         return output
-
-
+    
 def _replace_with_bipolarnet_linear(
     model,
     modules_to_not_convert=None,
