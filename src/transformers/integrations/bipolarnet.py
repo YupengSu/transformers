@@ -21,21 +21,27 @@ VALUES_PER_ITEM = 8
 
 def pack_weights(quantized_weights: torch.Tensor) -> torch.Tensor:
     """
-    Packs a tensor of binary weights (0/1) into a compact 1-bit-per-value format.
-    Each uint8 stores 8 binary weight values.
+    Packs a tensor of binary weights (-1/+1) into a compact 1-bit-per-value format.
+    Each uint8 stores 8 binary values.
+
+    Conversion:
+        -1 -> 0
+        +1 -> 1
 
     Parameters
     ----------
-    weights : torch.Tensor
-        A tensor containing binary weights with values in {0, 1}.
-        shape: [out_features, in_features] or [in_features]
+    quantized_weights : torch.Tensor
+        Tensor with values in {-1, +1}, shape: [out_features, in_features] or [in_features]
 
     Returns
     -------
     torch.Tensor
-        A packed tensor where each element stores 8 binary values.
-        shape: [out_features, ceil(in_features / 8)] or [ceil(in_features / 8)]
+        Packed tensor storing 8 binary values per uint8.
+        Shape: [out_features, ceil(in_features/8)] or [ceil(in_features/8)]
     """
+    
+    # Convert -1/+1 to 0/1
+    quantized_weights = ((quantized_weights + 1) // 2).to(torch.uint8)
 
     quantized_weights = quantized_weights.transpose(0, -1).contiguous()
     original_shape = quantized_weights.shape
@@ -63,18 +69,20 @@ def pack_weights(quantized_weights: torch.Tensor) -> torch.Tensor:
 @torch.compile
 def unpack_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """
-    Unpacks a tensor of quantized weights that were stored in a packed format using 2 bits per value.
+    Unpacks bipolar binary weights that were stored using 1 bit per value.
+    Converts the unpacked bits from {0,1} back to {-1,+1}.
 
     Parameters:
     -----------
     packed : torch.Tensor
-        A tensor containing packed weights where each element represents 8 quantized values (using 1 bits per value).
+        Packed tensor with 8 weights per uint8.
     dtype : torch.dtype
-        The dtype of the returned Tensor
+        Desired output dtype.
+
     Returns:
     --------
     torch.Tensor
-        A tensor of unpacked weights, where each value is converted from its packed 1-bit representation.
+        Unpacked bipolar weights in {-1, +1} and cast to dtype.
     """
     
     packed = packed.transpose(0, -1).contiguous()
@@ -94,6 +102,8 @@ def unpack_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
             idx = i * VALUES_PER_ITEM + bit
             unpacked[idx] = (packed[i] >> bit) & 1
     
+    # Convert 0/1 back to -1/+1
+    unpacked = unpacked * 2 - 1
     unpacked = unpacked.transpose(0, -1).contiguous()
     return unpacked.to(dtype)
 
@@ -189,7 +199,7 @@ class BipolarLinear(nn.Module):
 class WeightQuant(torch.autograd.Function):
     """
     Implements a custom autograd function for weight quantization.
-    This performs binary quantization (0, 1) based on scaling by the
+    This performs binary quantization (-1, 1) based on scaling by the
     mean value of the positive weights. It uses the Straight-Through Estimator
     (STE) for the backward pass.
     """
@@ -198,11 +208,10 @@ class WeightQuant(torch.autograd.Function):
     def forward(ctx, weight):
         dtype = weight.dtype
         weight = weight.float()
-        weight_bin = (weight >= 0).float()
-        scale = weight_bin.sum() / (weight.abs() * weight_bin).sum().clamp(min=1e-5)
-        weight = weight_bin / scale
+        scale = 1.0 / weight.abs().mean(dim=1, keepdim=True).clamp_(min=1e-5)
+        weight = weight.sign() / scale
         return weight.to(dtype)
-
+    
     @staticmethod
     def backward(ctx, grad_output):
         grad_input = grad_output.clone()
@@ -218,7 +227,6 @@ class ActQuant(torch.autograd.Function):
     """
 
     @staticmethod
-    @torch.compile
     def forward(ctx, activation):
         dtype = activation.dtype
         activation = activation.float()
@@ -254,13 +262,18 @@ class AutoBipolarLinear(nn.Module):
         # Optional RMSNorm
         self.rms_norm = None
         if use_rms_norm:
-            from ..models.llama.modeling_llama import LlamaRMSNorm
+            from transformers.models.llama.modeling_llama import LlamaRMSNorm
             self.rms_norm = LlamaRMSNorm(in_features, eps=rms_norm_eps)
         
-        self.weight_pos = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
-        self.weight_neg = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        self.weight_pos = nn.Linear(
+            in_features, out_features, bias=False, device=device, dtype=dtype
+        )
+        self.weight_neg = nn.Linear(
+            in_features, out_features, bias=False, device=device, dtype=dtype
+        )
+        
         if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device))
         else:
             self.bias = None
 
@@ -277,10 +290,14 @@ class AutoBipolarLinear(nn.Module):
         *args,
         **kwargs,
     ):
-        if (prefix + "weight_pos") in state_dict and state_dict[prefix + "weight_pos"].dtype != self.weight_pos.dtype:
-            state_dict[prefix + "weight_pos"] = unpack_weights(state_dict[prefix + "weight_pos"], dtype=self.weight_pos.dtype)
-        if (prefix + "weight_neg") in state_dict and state_dict[prefix + "weight_neg"].dtype != self.weight_neg.dtype:
-            state_dict[prefix + "weight_neg"] = unpack_weights(state_dict[prefix + "weight_neg"], dtype=self.weight_neg.dtype)
+        for name in ["weight_pos", "weight_neg"]:
+            key = f"{prefix}{name}.weight"
+            if key in state_dict:
+                module = getattr(self, name)
+                if state_dict[key].dtype != module.weight.dtype:
+                    state_dict[key] = unpack_weights(
+                        state_dict[key], dtype=module.weight.dtype
+                    )
         return state_dict
 
     def forward(self, input):
@@ -289,17 +306,16 @@ class AutoBipolarLinear(nn.Module):
             input = self.rms_norm(input)
 
         if self.online_quant:
-            weight_pos = WeightQuant.apply(self.weight_pos)
-            weight_neg = WeightQuant.apply(self.weight_neg)
+            weight_pos = WeightQuant.apply(self.weight_pos.weight)
+            weight_neg = WeightQuant.apply(self.weight_neg.weight)
         else:
-            weight_pos = self.weight_pos
-            weight_neg = self.weight_neg
+            weight_pos = self.weight_pos.weight / self.weight_scale_pos[:, None]
+            weight_neg = self.weight_neg.weight / self.weight_scale_neg[:, None]
+        
         input = ActQuant.apply(input)
-        if not self.online_quant:
-            weight_pos = weight_pos / self.weight_scale_pos
-            weight_neg = weight_neg / self.weight_scale_neg
         output = F.linear(input, weight_pos - weight_neg, self.bias)
         return output
+
     
 def _replace_with_bipolarnet_linear(
     model,

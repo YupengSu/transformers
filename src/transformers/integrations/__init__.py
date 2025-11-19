@@ -27,12 +27,14 @@ _import_structure = {
     ],
     "bitnet": [
         "BitLinear",
+        "AutoBitLinear",
         "pack_weights",
         "replace_with_bitnet_linear",
         "unpack_weights",
     ],
     "bipolarnet": [
         "BipolarLinear",
+        "AutoBipolarLinear",
         "pack_weights",
         "replace_with_bipolarnet_linear",
         "unpack_weights",
